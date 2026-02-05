@@ -169,6 +169,9 @@ main(void)
     bool have_first = false;
     int x0 = 0, y0 = 0;
 
+    // for storing basic framebuffer without previev
+    uint32_t saved_framebuffer[W * H];
+
     XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
 
     while (running)
@@ -205,25 +208,48 @@ main(void)
                 y0 = y;
                 have_first = true;
                 put_pixel(x0, y0, 255, 255, 255);
+
+                // save framebuffer state after first dot
+                memcpy(saved_framebuffer, framebuffer, sizeof(framebuffer));
+
                 XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
             }
             else
             {
-                if (e.xbutton.state & ControlMask)
-                {
-                    draw_dotted_line(x0, y0, x, y, 255, 255, 255);
-                }
-                else
-                {
-                    if (e.xbutton.state & ShiftMask)
-                        snap_to_axis(x0, y0, &x, &y);
+                // restore saved framebuffer before drawing final line
+                memcpy(framebuffer, saved_framebuffer, sizeof(framebuffer));
 
+                if (e.xbutton.state & ShiftMask)
+                    snap_to_axis(x0, y0, &x, &y);
+
+                if (e.xbutton.state & ControlMask)
+                    draw_dotted_line(x0, y0, x, y, 255, 255, 255);
+                else
                     draw_line(x0, y0, x, y, 255, 255, 255);
-                }
 
                 have_first = false;
                 XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
             }
+        }
+        else if (e.type == MotionNotify && have_first)
+        {
+            // preview
+            int x = e.xmotion.x;
+            int y = e.xmotion.y;
+
+            // restore saved framebuffe
+            memcpy(framebuffer, saved_framebuffer, sizeof(framebuffer));
+
+            // draw preview line
+            if (e.xbutton.state & ShiftMask)
+                snap_to_axis(x0, y0, &x, &y);
+
+            if (e.xbutton.state & ControlMask)
+                draw_dotted_line(x0, y0, x, y, 100, 100, 100);
+            else
+                draw_line(x0, y0, x, y, 100, 100, 100);
+
+            XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
         }
     }
 
