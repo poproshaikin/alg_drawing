@@ -1,38 +1,164 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define W 800
-#define H 600
+typedef struct
+{
+    uint32_t* data;
+    uint32_t* saved;
+} Framebuffer;
 
-uint32_t framebuffer[W * H];
+typedef struct
+{
+    Display* dpy;
+    Window win;
+    GC gc;
+    XImage* img;
+    int w;
+    int h;
+    Framebuffer fb;
+} DisplayContext;
+
+typedef struct
+{
+    bool running;
+    bool have_first; // first point is selected
+    int x0, y0; // cursor position
+    unsigned int modifiers; // shift / control
+} InputState;
+
+typedef void (*EventHandler)(XEvent*, DisplayContext*, InputState*);
+
+#define MAX_HANDLERS 32
+EventHandler handlers[MAX_HANDLERS];
+int handler_count = 0;
+
+void register_handler(EventHandler h)
+{
+    if (handler_count < MAX_HANDLERS)
+        handlers[handler_count++] = h;
+}
+
+void terminate(const char* message)
+{
+    fprintf(stderr, "execution terminated, reason: %s", message);
+}
+
+Framebuffer
+init_framebuffer(int w, int h)
+{
+    uint32_t* data = calloc(w * h, sizeof(uint32_t));
+    uint32_t* saved = calloc(w * h, sizeof(uint32_t));
+
+    Framebuffer fb;
+    fb.data = data;
+    fb.saved = saved;
+
+    return fb;
+}
+
+void
+fill_framebuffer(const DisplayContext* ctx, uint8_t r, uint8_t g, uint8_t b)
+{
+     uint32_t color = (r << 16) | (g << 8) | b;
+     for (int i = 0; i < ctx->w * ctx->h; ++i)
+         ctx->fb.data[i] = color;
+}
+
+void
+clear_framebuffer(const DisplayContext* ctx)
+{
+    fill_framebuffer(ctx, 0, 0, 0);
+}
 
 static inline void
-put_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b)
+render_frame(DisplayContext* ctx)
 {
-    if ((unsigned)x >= W || (unsigned)y >= H)
+    XPutImage(ctx->dpy, ctx->win, ctx->gc, ctx->img, 0, 0, 0, 0, ctx->w, ctx->h);
+}
+
+DisplayContext
+init_display(int w, int h)
+{
+    Display* dpy = XOpenDisplay(NULL);
+    if (!dpy)
+        terminate("cannot open display");
+
+    int screen = DefaultScreen(dpy);
+
+    Window win = XCreateSimpleWindow(
+        dpy,
+        RootWindow(dpy, screen),
+        100,
+        100,
+        w,
+        h,
+        1,
+        BlackPixel(dpy, screen),
+        WhitePixel(dpy, screen)
+    );
+
+    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | PointerMotionMask);
+    XMapWindow(dpy, win);
+
+    Framebuffer fb = init_framebuffer(w, h);
+
+    GC gc = XCreateGC(dpy, win, 0, 0);
+    XImage* img = XCreateImage(
+        dpy,
+        DefaultVisual(dpy, screen),
+        DefaultDepth(dpy, screen),
+        ZPixmap,
+        0,
+        (char*)fb.data,
+        w,
+        h,
+        32,
+        0
+    );
+    if (!img)
+        terminate("cannot create image");
+
+    DisplayContext ctx;
+    ctx.dpy = dpy;
+    ctx.win = win;
+    ctx.gc = gc;
+    ctx.img = img;
+    ctx.w = w;
+    ctx.h = h;
+    ctx.fb = fb;
+
+    clear_framebuffer(&ctx);
+
+    return ctx;
+}
+
+void cleanup_display(DisplayContext* ctx)
+{
+    ctx->img->data = NULL;
+    XDestroyImage(ctx->img);
+    XDestroyWindow(ctx->dpy, ctx->win);
+    XCloseDisplay(ctx->dpy);
+}
+
+static inline void
+put_pixel(DisplayContext* ctx, int x, int y, uint8_t r, uint8_t g, uint8_t b)
+{
+    if ((unsigned)x >= ctx->w || (unsigned)y >= ctx->h)
         return;
 
     uint32_t color = (r << 16) | (g << 8) | b;
-    framebuffer[y * W + x] = color;
-}
-
-static void
-clear_framebuffer(uint8_t r, uint8_t g, uint8_t b)
-{
-    uint32_t color = (r << 16) | (g << 8) | b;
-    for (int i = 0; i < W * H; ++i)
-        framebuffer[i] = color;
+    ctx->fb.data[y * ctx->w + x] = color;
 }
 
 /* Bresenham's line algorithm */
 static void
-draw_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
+draw_line(DisplayContext* ctx, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
 {
     int dx = abs(x1 - x0);
     int sx = x0 < x1 ? 1 : -1;
@@ -42,7 +168,7 @@ draw_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
 
     while (1)
     {
-        put_pixel(x0, y0, r, g, b);
+        put_pixel(ctx, x0, y0, r, g, b);
 
         if (x0 == x1 && y0 == y1)
             break;
@@ -62,7 +188,7 @@ draw_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
 }
 
 static void
-draw_dotted_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
+draw_dotted_line(DisplayContext* ctx, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b)
 {
     int dx = abs(x1 - x0);
     int sx = x0 < x1 ? 1 : -1;
@@ -75,7 +201,7 @@ draw_dotted_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b
     while (1)
     {
         if ((counter % 10) < 2)
-            put_pixel(x0, y0, r, g, b);
+            put_pixel(ctx, x0, y0, r, g, b);
 
         counter++;
 
@@ -98,7 +224,7 @@ draw_dotted_line(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b
 
 /* Snap line to nearest axis (horizontal/vertical/45°) */
 static void
-snap_to_axis(int x0, int y0, int* x1, int* y1)
+snap_to_axis(DisplayContext* ctx, int x0, int y0, int* x1, int* y1)
 {
     int dx = *x1 - x0;
     int dy = *y1 - y0;
@@ -125,138 +251,74 @@ snap_to_axis(int x0, int y0, int* x1, int* y1)
     }
 }
 
-int
-main(void)
+#define W 600
+#define H 800
+
+void
+handle_keypress(XEvent* e, DisplayContext* ctx, InputState* state)
 {
-    Display* dpy = XOpenDisplay(NULL);
-    if (!dpy)
-        return 1;
+    if (e->type != KeyPress) return;
 
-    int screen = DefaultScreen(dpy);
+    KeySym sym = XLookupKeysym(&e->xkey, 0);
+    if (sym == XK_Escape || sym == XK_q)
+        state->running = false;
+    else if (sym == XK_c || sym == XK_C) {
+        clear_framebuffer(ctx);
+        state->have_first = false;
+        XPutImage(ctx->dpy, ctx->win, ctx->gc, ctx->img, 0,0,0,0, ctx->w, ctx->h);
+    }
+}
 
-    Window win = XCreateSimpleWindow(
-        dpy,
-        RootWindow(dpy, screen),
-        100,
-        100,
-        W,
-        H,
-        1,
-        BlackPixel(dpy, screen),
-        WhitePixel(dpy, screen)
-    );
+void
+handle_click(XEvent* e, DisplayContext* ctx, InputState* state)
+{
+    if (e->type != ButtonPress) return;
 
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | PointerMotionMask);
-    XMapWindow(dpy, win);
+    int x = e->xbutton.x;
+    int y = e->xbutton.y;
 
-    GC gc = XCreateGC(dpy, win, 0, 0);
-    XImage* img = XCreateImage(
-        dpy,
-        DefaultVisual(dpy, screen),
-        DefaultDepth(dpy, screen),
-        ZPixmap,
-        0,
-        (char*)framebuffer,
-        W,
-        H,
-        32,
-        0
-    );
+    if (!state->have_first) {
+        state->x0 = x; state->y0 = y;
+        state->have_first = true;
+        put_pixel(ctx, x, y, 255,255,255);
 
-    clear_framebuffer(0, 0, 0);
+        memcpy(ctx->fb.saved, ctx->fb.data, ctx->w * ctx->h * sizeof(uint32_t));
 
-    bool running = true;
-    bool have_first = false;
-    int x0 = 0, y0 = 0;
+        XPutImage(ctx->dpy, ctx->win, ctx->gc, ctx->img, 0,0,0,0, ctx->w, ctx->h);
+    } else {
+        memcpy(ctx->fb.data, ctx->fb.saved, ctx->w*ctx->h*sizeof(uint32_t));
 
-    // for storing basic framebuffer without previev
-    uint32_t saved_framebuffer[W * H];
+        if (e->xbutton.state & ShiftMask)
+            snap_to_axis(ctx, state->x0, state->y0, &x, &y);
 
-    XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
+        if (e->xbutton.state & ControlMask)
+            draw_dotted_line(ctx, state->x0,state->y0,x,y,255,255,255);
+        else
+            draw_line(ctx, state->x0, state->y0, x, y, 255, 255, 255);
 
-    while (running)
+        state->have_first = false;
+        XPutImage(ctx->dpy, ctx->win, ctx->gc, ctx->img, 0,0,0,0, ctx->w, ctx->h);
+    }
+}
+
+int main()
+{
+    DisplayContext ctx = init_display(W, H);
+    InputState state = { .running = true, .have_first = false };
+    render_frame(&ctx);
+
+    register_handler(handle_keypress);
+    register_handler(handle_click);
+
+    while (state.running)
     {
         XEvent e;
-        XNextEvent(dpy, &e);
+        XNextEvent(ctx.dpy, &e);
 
-        if (e.type == Expose)
-        {
-            XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
-        }
-        else if (e.type == KeyPress)
-        {
-            XKeyEvent* kev = &e.xkey;
-            KeySym sym = XLookupKeysym(kev, 0);
-            if (sym == XK_Escape || sym == XK_q)
-                running = false;
+        for (int i=0; i<handler_count; i++)
+            handlers[i](&e, &ctx, &state);
 
-            else if (sym == XK_c || sym == XK_C)
-            {
-                clear_framebuffer(0, 0, 0);
-                have_first = false;
-                XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
-            }
-        }
-        else if (e.type == ButtonPress)
-        {
-            int x = e.xbutton.x;
-            int y = e.xbutton.y;
-
-            if (!have_first)
-            {
-                x0 = x;
-                y0 = y;
-                have_first = true;
-                put_pixel(x0, y0, 255, 255, 255);
-
-                // save framebuffer state after first dot
-                memcpy(saved_framebuffer, framebuffer, sizeof(framebuffer));
-
-                XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
-            }
-            else
-            {
-                // restore saved framebuffer before drawing final line
-                memcpy(framebuffer, saved_framebuffer, sizeof(framebuffer));
-
-                if (e.xbutton.state & ShiftMask)
-                    snap_to_axis(x0, y0, &x, &y);
-
-                if (e.xbutton.state & ControlMask)
-                    draw_dotted_line(x0, y0, x, y, 255, 255, 255);
-                else
-                    draw_line(x0, y0, x, y, 255, 255, 255);
-
-                have_first = false;
-                XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
-            }
-        }
-        else if (e.type == MotionNotify && have_first)
-        {
-            // preview
-            int x = e.xmotion.x;
-            int y = e.xmotion.y;
-
-            // restore saved framebuffe
-            memcpy(framebuffer, saved_framebuffer, sizeof(framebuffer));
-
-            // draw preview line
-            if (e.xbutton.state & ShiftMask)
-                snap_to_axis(x0, y0, &x, &y);
-
-            if (e.xbutton.state & ControlMask)
-                draw_dotted_line(x0, y0, x, y, 100, 100, 100);
-            else
-                draw_line(x0, y0, x, y, 100, 100, 100);
-
-            XPutImage(dpy, win, gc, img, 0, 0, 0, 0, W, H);
-        }
     }
 
-    img->data = NULL;
-    XDestroyImage(img);
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
-
-    return 0;
+    cleanup_display(&ctx);
 }
