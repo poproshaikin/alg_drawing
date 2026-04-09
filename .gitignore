@@ -5,3 +5,6 @@ cmake_install.cmake
 CMakeFiles
 cmake-build-debug
 .idea
+build.ninja
+.ninja_deps
+.cmake
